@@ -1,0 +1,11 @@
+name = "vyra-webrtc"
+main = "src/index.js"
+compatibility_date = "2026-11-21"
+
+[[durable_objects.bindings]]
+name = "CALL_ROOMS"
+class_name = "CallRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CallRoom"]
