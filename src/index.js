@@ -39,19 +39,29 @@ async function firebaseTokenVerify(token) {
     const header = decode(parts[0]);
     const claims = decode(parts[1]);
 
+    const now = Math.floor(Date.now() / 1000);
+
     if (
         header.alg !== "RS256" ||
         !header.kid ||
         claims.aud !== PROJECT_ID ||
         claims.iss !== `https://securetoken.google.com/${PROJECT_ID}` ||
+        typeof claims.sub !== "string" ||
         !claims.sub ||
         claims.sub.length > 128 ||
-        claims.exp <= Math.floor(Date.now() / 1000)
+        !Number.isInteger(claims.iat) ||
+        !Number.isInteger(claims.auth_time) ||
+        !Number.isInteger(claims.exp) ||
+        claims.iat > now + 300 ||
+        claims.auth_time > now + 300 ||
+        claims.auth_time > claims.iat ||
+        claims.exp <= now ||
+        claims.exp <= claims.iat
     ) {
         throw new Error("Firebase kimliği geçersiz.");
     }
 
-    if (!cachedKeys || cachedKeys.expires < Date.now()) {
+    const refreshKeys = async () => {
         const response = await fetch(
             "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com"
         );
@@ -61,9 +71,19 @@ async function firebaseTokenVerify(token) {
             keys: (await response.json()).keys,
             expires: Date.now() + 3600000
         };
+    };
+
+    if (!cachedKeys || cachedKeys.expires < Date.now()) {
+        await refreshKeys();
     }
 
-    const jwk = cachedKeys.keys.find(key => key.kid === header.kid);
+    let jwk = cachedKeys.keys.find(key => key.kid === header.kid);
+
+    if (!jwk) {
+        await refreshKeys();
+        jwk = cachedKeys.keys.find(key => key.kid === header.kid);
+    }
+
     if (!jwk) throw new Error("İmza anahtarı bulunamadı.");
 
     const key = await crypto.subtle.importKey(
@@ -91,6 +111,45 @@ async function firebaseTokenVerify(token) {
     return claims.sub;
 }
 
+async function getActiveCallSession(token, uid, sessionId) {
+    if (typeof sessionId !== "string" ||
+        !/^[A-Za-z0-9_-]{1,150}$/.test(sessionId)) {
+        throw new Error("Geçersiz görüşme kimliği.");
+    }
+
+    const endpoint =
+        `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/callSessions/${encodeURIComponent(sessionId)}`;
+
+    const response = await fetch(endpoint, {
+        headers: { Authorization: `Bearer ${token}` }
+    });
+
+    if (!response.ok) {
+        throw new Error(
+            response.status === 404
+                ? "Görüşme kaydı bulunamadı."
+                : "Görüşme kaydı doğrulanamadı."
+        );
+    }
+
+    const document = await response.json();
+    const fields = document.fields || {};
+
+    const userId = fields.userId?.stringValue;
+    const modelId = fields.modelId?.stringValue;
+    const status = fields.status?.stringValue;
+
+    if (!userId || !modelId || status !== "active") {
+        throw new Error("Görüşme aktif değil veya kayıt geçersiz.");
+    }
+
+    if (uid !== userId && uid !== modelId) {
+        throw new Error("Bu görüşmeye katılma yetkiniz yok.");
+    }
+
+    return { userId, modelId, status };
+}
+
 export class CallRoom extends DurableObject {
     constructor(ctx, env) {
         super(ctx, env);
@@ -100,7 +159,14 @@ export class CallRoom extends DurableObject {
     async fetch(request) {
         if (request.method === "POST" && new URL(request.url).pathname === "/invite") {
             const uid = request.headers.get("X-Vyra-User");
-            if (!uid) return new Response("Yetkisiz.", { status: 401 });
+            const modelUid = request.headers.get("X-Vyra-Model");
+            const sessionId = request.headers.get("X-Vyra-Session");
+
+            if (!uid || !modelUid || !sessionId || uid === modelUid) {
+                return new Response("Görüşme katılımcıları geçersiz.", {
+                    status: 400
+                });
+            }
 
             const existing = await this.ctx.storage.get("room");
             if (existing && existing.expiresAt > Date.now()) {
@@ -113,6 +179,8 @@ export class CallRoom extends DurableObject {
             const inviteKey = randomToken(32);
             const room = {
                 ownerUid: uid,
+                modelUid,
+                sessionId,
                 inviteHash: await hash(inviteKey),
                 expiresAt: Date.now() + INVITE_TTL,
                 guestUid: null
@@ -124,6 +192,22 @@ export class CallRoom extends DurableObject {
                 ok: true,
                 inviteKey,
                 expiresAt: room.expiresAt
+            });
+        }
+
+        if (request.method === "GET" && new URL(request.url).pathname === "/session") {
+            const room = await this.ctx.storage.get("room");
+
+            if (!room || room.expiresAt <= Date.now()) {
+                return new Response("Oda bulunamadı veya süresi dolmuş.", {
+                    status: 404
+                });
+            }
+
+            return Response.json({
+                ownerUid: room.ownerUid,
+                modelUid: room.modelUid,
+                sessionId: room.sessionId
             });
         }
 
@@ -147,13 +231,19 @@ export class CallRoom extends DurableObject {
             return new Response("Davet anahtarı hatalı.", { status: 403 });
         }
 
-        if (uid !== room.ownerUid) {
-            if (uid === room.ownerUid) {
-                return new Response("Geçersiz katılımcı.", { status: 403 });
-            }
+        if (uid !== room.ownerUid && uid !== room.modelUid) {
+            return new Response("Bu görüşmeye katılma yetkiniz yok.", {
+                status: 403
+            });
+        }
+
+        if (uid === room.modelUid) {
             if (room.guestUid && room.guestUid !== uid) {
-                return new Response("Oda başka bir kullanıcıya ayrılmış.", { status: 409 });
+                return new Response("Oda başka bir kullanıcıya ayrılmış.", {
+                    status: 409
+                });
             }
+
             room.guestUid = uid;
             await this.ctx.storage.put("room", room);
         }
@@ -255,20 +345,40 @@ export default {
             }
 
             try {
-                const uid = await firebaseTokenVerify(auth.slice(7));
+                const token = auth.slice(7);
+                const uid = await firebaseTokenVerify(token);
+
+                let body;
+                try {
+                    body = await request.json();
+                } catch {
+                    throw new Error("Geçerli görüşme bilgisi gönderilmedi.");
+                }
+
+                const sessionId = body?.sessionId;
+                const session = await getActiveCallSession(token, uid, sessionId);
+
+                if (uid !== session.userId) {
+                    throw new Error("Davet yalnızca görüşmeyi başlatan kullanıcı tarafından oluşturulabilir.");
+                }
+
                 const callId = randomToken(18);
                 const id = env.CALL_ROOMS.idFromName(callId);
                 const room = env.CALL_ROOMS.get(id);
 
                 const response = await room.fetch("https://internal/invite", {
                     method: "POST",
-                    headers: { "X-Vyra-User": uid }
+                    headers: {
+                        "X-Vyra-User": uid,
+                        "X-Vyra-Model": session.modelId,
+                        "X-Vyra-Session": sessionId
+                    }
                 });
 
                 if (!response.ok) return response;
 
                 const data = await response.json();
-                return Response.json({ ...data, callId });
+                return Response.json({ ...data, callId, sessionId });
             } catch (error) {
                 return new Response(error.message || "Yetkilendirme başarısız.", {
                     status: 403
@@ -305,11 +415,37 @@ export default {
         }
 
         try {
-            const uid = await firebaseTokenVerify(protocols[1]);
+            const token = protocols[1];
+            const uid = await firebaseTokenVerify(token);
             const id = env.CALL_ROOMS.idFromName(callId);
             const room = env.CALL_ROOMS.get(id);
-            const headers = new Headers(request.headers);
 
+            const sessionResponse = await room.fetch("https://internal/session");
+            if (!sessionResponse.ok) {
+                return new Response("Görüşme odası geçersiz veya süresi dolmuş.", {
+                    status: 403
+                });
+            }
+
+            const roomInfo = await sessionResponse.json();
+
+            const session = await getActiveCallSession(
+                token,
+                uid,
+                roomInfo.sessionId
+            );
+
+            if (
+                session.userId !== roomInfo.ownerUid ||
+                session.modelId !== roomInfo.modelUid ||
+                (uid !== roomInfo.ownerUid && uid !== roomInfo.modelUid)
+            ) {
+                return new Response("Görüşme katılımcısı doğrulanamadı.", {
+                    status: 403
+                });
+            }
+
+            const headers = new Headers(request.headers);
             headers.set("X-Vyra-User", uid);
             headers.set("X-Vyra-Invite", protocols[2]);
             headers.set("Sec-WebSocket-Protocol", "vyra");
