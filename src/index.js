@@ -326,6 +326,34 @@ export default {
     async fetch(request, env) {
         const url = new URL(request.url);
 
+        const withCors = response => {
+            const headers = new Headers(response.headers);
+            headers.set("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+            headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+            headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type");
+            headers.append("Vary", "Origin");
+
+            return new Response(response.body, {
+                status: response.status,
+                statusText: response.statusText,
+                headers
+            });
+        };
+
+        if (url.pathname === "/invite" &&
+            request.headers.get("Origin") === ALLOWED_ORIGIN &&
+            request.method === "OPTIONS") {
+            return new Response(null, {
+                status: 204,
+                headers: {
+                    "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+                    "Access-Control-Allow-Methods": "POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+                    "Vary": "Origin"
+                }
+            });
+        }
+
         if (url.pathname === "/health") {
             return Response.json({
                 ok: true,
@@ -341,7 +369,7 @@ export default {
 
             const auth = request.headers.get("Authorization") || "";
             if (!auth.startsWith("Bearer ")) {
-                return new Response("Kimlik doğrulama gerekli.", { status: 401 });
+                return withCors(new Response("Kimlik doğrulama gerekli.", { status: 401 }));
             }
 
             try {
@@ -375,14 +403,14 @@ export default {
                     }
                 });
 
-                if (!response.ok) return response;
+                if (!response.ok) return withCors(response);
 
                 const data = await response.json();
-                return Response.json({ ...data, callId, sessionId });
+                return withCors(Response.json({ ...data, callId, sessionId }));
             } catch (error) {
-                return new Response(error.message || "Yetkilendirme başarısız.", {
+                return withCors(new Response(error.message || "Yetkilendirme başarısız.", {
                     status: 403
-                });
+                }));
             }
         }
 
